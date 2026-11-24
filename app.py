@@ -5,16 +5,20 @@ import json
 import math
 import os
 import re
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
+from broker import BrokerQuotes
 from crypto_monitor import listen, opportunity
 from history import History
+from transfer import OrderBookSamples, TransferError, estimate
 
 VENUES = ("Bybit", "OKX", "Bitget", "Kraken")
 DEFAULT_PAIRS = ",".join(f"{coin}/USDT" for coin in
@@ -57,6 +61,7 @@ class Market:
         self.max_age = number("MAX_AGE_MS", 1000, 50, 60000) / 1000
         self.max_skew = number("MAX_SKEW_MS", 500, 50, 60000) / 1000
         self.quotes = {}
+        self.samples = OrderBookSamples()
         self.status = {}
         self.active = {}
         self.pending = {}
@@ -114,7 +119,9 @@ class Market:
 
     async def publish(self):
         while True:
-            self.frame = json.dumps(self.snapshot(time.monotonic()), ensure_ascii=False, allow_nan=False)
+            now = time.monotonic()
+            self.samples.capture(now, self.quotes, self.max_age)
+            self.frame = json.dumps(self.snapshot(now), ensure_ascii=False, allow_nan=False)
             await asyncio.sleep(0.2)
 
 
@@ -145,10 +152,13 @@ class Market:
 async def lifespan(app):
     market = Market()
     app.state.market = market
+    brokers = app.state.brokers = BrokerQuotes()
     tasks = [asyncio.create_task(listen(venue, market.pairs, market.quotes, market.status))
              for venue in VENUES]
     tasks.append(asyncio.create_task(market.publish()))
     tasks.append(asyncio.create_task(market.write_history()))
+    if brokers.password:
+        tasks.extend([asyncio.create_task(brokers.run_oanda()), asyncio.create_task(brokers.run_ig())])
     try:
         yield
     finally:
@@ -196,3 +206,76 @@ async def events(request: Request):
 
     return StreamingResponse(stream(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-store"})
+
+
+basic = HTTPBasic(auto_error=False)
+
+
+def check_markets(request: Request, credentials: HTTPBasicCredentials | None = Depends(basic)):
+    password = request.app.state.brokers.password
+    if password and (credentials is None or credentials.username != "viewer" or
+                     not secrets.compare_digest(credentials.password.encode(), password.encode())):
+        raise HTTPException(401, "請登入行情頁", headers={"WWW-Authenticate": "Basic"})
+
+
+@app.get("/markets", dependencies=[Depends(check_markets)])
+async def markets_page():
+    return FileResponse(PAGE.with_name("markets.html"), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/markets", dependencies=[Depends(check_markets)])
+async def broker_snapshot(request: Request):
+    return JSONResponse(request.app.state.brokers.snapshot(), headers={"Cache-Control": "no-store"})
+
+
+@app.get("/transfer")
+async def transfer_page():
+    return FileResponse(PAGE.with_name("transfer.html"))
+
+
+@app.get("/api/transfer/options")
+async def transfer_options(request: Request):
+    market = request.app.state.market
+    return {"pairs": [pair for pair in market.pairs if pair.endswith("/USDT")], "venues": VENUES}
+
+
+@app.get("/api/transfer")
+async def transfer_estimate(request: Request, pair: str, buy: str, sell: str,
+                            amount: float = Query(100, gt=0, le=1e8),
+                            funding_fee: float = Query(ge=0, le=1e8),
+                            coin_fee: float = Query(ge=0, le=1e10),
+                            return_fee: float = Query(ge=0, le=1e8),
+                            funding_seconds: int = Query(0, ge=0, le=1800),
+                            transfer_seconds: int = Query(300, ge=1, le=1800),
+                            replay: bool = False, start_at: float | None = None):
+    market = request.app.state.market
+    if pair not in market.pairs or not pair.endswith("/USDT") or buy == sell or buy not in VENUES or sell not in VENUES:
+        raise HTTPException(400, "請選擇受監控的 USDT 幣對及兩個不同平台")
+    now, wall = time.monotonic(), time.time()
+    buy_key, sell_key = (buy, pair), (sell, pair)
+    try:
+        if replay:
+            if start_at is None or not math.isfinite(start_at) or not 0 <= wall - start_at <= 3600:
+                raise TransferError("選擇最近一小時內的歷史起始時間")
+            buy_target = now - (wall - start_at) + funding_seconds
+            buy_at, ask = market.samples.at_or_after(buy_key, buy_target)
+            sell_at, bid = market.samples.at_or_after(sell_key, buy_at + transfer_seconds)
+        else:
+            ask, bid = market.quotes.get(buy_key), market.quotes.get(sell_key)
+            if not ask or not bid or now - min(ask.received, bid.received) > market.max_age:
+                raise TransferError("目前沒有足夠新鮮的雙邊報價")
+            if abs(ask.received - bid.received) > market.max_skew:
+                raise TransferError("雙邊報價時間差過大，請再試一次")
+            buy_at, sell_at = ask.received, bid.received
+        result = estimate(amount, funding_fee, coin_fee, return_fee, ask, bid,
+                          market.fees[buy], market.fees[sell])
+    except TransferError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return JSONResponse({**result, "buy_at": wall + buy_at - now, "sell_at": wall + sell_at - now,
+                         "buy_fee": market.fees[buy], "sell_fee": market.fees[sell]},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/tools.css")
+async def tools_styles():
+    return FileResponse(PAGE.with_name("tools.css"), media_type="text/css")

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>外匯／黃金／商品</title><link rel="stylesheet" href="/tools.css"></head>
+<body><main>
+<header><div><h1>外匯／黃金／商品</h1><nav><a href="/">加密貨幣</a> · <a href="/transfer">轉幣搬磚試算</a></nav></div></header>
+<div class="feeds" id="feeds" aria-live="polite">等待行情</div>
+<section><div class="heading"><h2>IG × OANDA 報價</h2></div>
+<p class="note">黃金與白銀以美元／金衡盎司比較。方向差額為賣出端 Bid 減買入端 Ask，平倉、佣金與隔夜費須另計。方向差額只計算同為正式或同為模擬，且來源時間夠新的報價。原油先列報價，合約規格核對後才能比較。</p>
+<div class="scroll"><table>
+<thead><tr><th>商品</th><th>IG Bid／Ask</th><th>IG 點差</th><th>OANDA Bid／Ask</th><th>OANDA 點差</th><th>IG 買 → OANDA 賣</th><th>OANDA 買 → IG 賣</th></tr></thead>
+<tbody id="markets"></tbody>
+</table></div></section>
+</main>
+<script>
+const tbody = document.getElementById('markets');
+const feeds = document.getElementById('feeds');
+const format = new Intl.NumberFormat('en-US', {maximumSignificantDigits: 9});
+function render({at, status, modes, rows}) {
+  feeds.textContent = Object.entries(status).map(([name, state]) => name + '（' + modes[name] + '） ' + state).join(' · ');
+  const table = document.createDocumentFragment();
+  for (const item of rows) {
+    const tr = table.appendChild(document.createElement('tr'));
+    tr.insertCell().textContent = item.symbol;
+    for (const quote of [item.ig, item.oanda]) {
+      tr.insertCell().textContent = quote ? format.format(quote.bid) + ' / ' + format.format(quote.ask) +
+        ' · ' + (quote.source_epoch === null ? '來源時間未知' : Math.max(0, at - quote.source_epoch).toFixed(1) + ' 秒前報價') : '—';
+      tr.insertCell().textContent = quote ? format.format(quote.ask - quote.bid) : '—';
+    }
+    for (const gap of [item.ig_to_oanda, item.oanda_to_ig]) {
+      tr.insertCell().textContent = gap === null ? '—' : format.format(gap);
+    }
+  }
+  tbody.replaceChildren(table);
+}
+async function refresh() {
+  try {
+    const response = await fetch('/api/markets');
+    if (!response.ok) throw Error();
+    render(await response.json());
+  } catch {
+    feeds.textContent = '暫時無法讀取行情';
+    tbody.replaceChildren();
+  } finally { setTimeout(refresh, 2000); }
+}
+refresh();
+</script></body></html>

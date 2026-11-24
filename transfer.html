@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>轉幣搬磚試算</title><link rel="stylesheet" href="/tools.css"></head>
+<body><main>
+<header><div><h1>轉幣搬磚試算</h1><nav><a href="/">加密貨幣</a> · <a href="/markets">外匯／黃金</a></nav></div></header>
+<section>
+<div class="heading"><h2>USDT → A 買幣 → 轉幣到 B → 賣出</h2></div>
+<p class="note">費用與到帳時間請依所選網路填入。操作前請核對兩所的充提狀態、最低金額及網路。當下試算採目前盤口，歷史模擬採目標時間後首筆符合時效的樣本。</p>
+<form id="trial">
+<div class="controls">
+<label>交易對<select name="pair" required></select></label>
+<label>A 買入<select name="buy" required></select></label>
+<label>B 賣出<select name="sell" required></select></label>
+<label>起始本金（USDT）<input name="amount" type="number" min="0.00000001" max="100000000" step="any" value="100" required></label>
+</div>
+<div class="controls">
+<label>轉 USDT 到 A 的費用<input name="funding_fee" placeholder="免收填 0" type="number" min="0" step="any" required></label>
+<label>轉幣到 B 的總扣量（標的幣）<input name="coin_fee" placeholder="免收填 0" type="number" min="0" step="any" required></label>
+<label>USDT 回程費用<input name="return_fee" placeholder="無回程填 0" type="number" min="0" step="any" required></label>
+</div>
+<div class="controls">
+<label>USDT 到 A（秒）<input name="funding_seconds" type="number" min="0" max="1800" value="0" required></label>
+<label>標的幣到 B（秒）<input name="transfer_seconds" type="number" min="1" max="1800" value="300" required></label>
+<label>歷史起始時間（裝置時間）<input name="start_at" type="datetime-local" step="1"></label>
+</div>
+<div><button type="submit" value="live" disabled>按現在報價試算</button> <button type="submit" value="history" disabled>按到帳時間回放</button></div>
+</form>
+<output id="result" aria-live="polite"></output>
+</section>
+</main>
+<script>
+const form = document.getElementById('trial');
+const result = document.getElementById('result');
+const fmt = new Intl.NumberFormat('en-US', {maximumSignificantDigits: 12});
+const clock = new Intl.DateTimeFormat('zh-TW', {timeZone:'Asia/Taipei', timeStyle:'medium'});
+const buttons = [...form.querySelectorAll('button')];
+function enableButtons(enabled) { buttons.forEach(button => {button.disabled = !enabled;}); }
+async function initialize() {
+  try {
+    const response = await fetch('/api/transfer/options');
+    if (!response.ok) throw Error();
+    const {pairs, venues} = await response.json();
+    for (const [name, options] of Object.entries({pair:pairs, buy:venues, sell:venues})) {
+      form.elements[name].replaceChildren(...options.map(text => new Option(text, text)));
+    }
+    form.elements.sell.selectedIndex = 1;
+    if (!pairs.length) { result.textContent = '目前未設定 USDT 幣對'; return; }
+    enableButtons(true);
+  } catch { result.textContent = '無法讀取交易對，請重新整理'; }
+}
+form.addEventListener('submit', async event => {
+  event.preventDefault();
+  const params = new URLSearchParams(new FormData(form));
+  const replay = event.submitter?.value === 'history';
+  const time = new Date(params.get('start_at')).getTime() / 1000;
+  params.delete('start_at');
+  if (replay && !Number.isFinite(time)) { result.textContent = '請填寫歷史起始時間'; return; }
+  params.set('replay', replay);
+  if (replay) params.set('start_at', time);
+  enableButtons(false);
+  result.textContent = '試算中';
+  try {
+    const response = await fetch('/api/transfer?' + params);
+    const data = await response.json();
+    if (!response.ok) {
+      result.textContent = typeof data.detail === 'string' ? data.detail : '請檢查試算欄位';
+      return;
+    }
+    const coin = params.get('pair').split('/')[0];
+    result.textContent = [
+      replay ? '歷史回放（台北時間）' : '當下報價試算（賣出價會在轉帳期間變動）',
+      'A 買入價 ' + fmt.format(data.ask) + ' USDT · ' + clock.format(data.buy_at * 1000),
+      'B 賣出價 ' + fmt.format(data.bid) + ' USDT · ' + clock.format(data.sell_at * 1000),
+      '預計到 B ' + fmt.format(data.received) + ' ' + coin,
+      'B 打平賣價 ' + fmt.format(data.break_even) + ' USDT／' + coin,
+      '最後餘額 ' + fmt.format(data.end) + ' USDT · 淨差額 ' + fmt.format(data.net) + ' USDT',
+      'A／B 吃單費率 ' + fmt.format(data.buy_fee*100) + '%／' + fmt.format(data.sell_fee*100) + '%'
+    ].join('\n');
+  } catch { result.textContent = '無法完成試算，請稍後重試'; }
+  finally { enableButtons(true); }
+});
+initialize();
+</script></body></html>

@@ -14,8 +14,11 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from crypto_monitor import listen, opportunity
 
-VENUES = ("Binance", "Bybit", "OKX")
-DEFAULT_PAIRS = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT"
+VENUES = ("Bybit", "OKX", "Bitget", "Kraken")
+DEFAULT_PAIRS = ",".join(f"{coin}/USDT" for coin in
+                         "BTC ETH SOL XRP DOGE LINK AVAX ADA SUI APT NEAR DOT LTC".split())
+DEFAULT_PAIRS += ",ETH/BTC,SOL/BTC,BTC/USDC,ETH/USDC"
+QUOTE_DEFAULTS = {"USDT": 100, "USDC": 100, "BTC": 0.001, "ETH": 0.05}
 PAGE = Path(__file__).with_name("index.html")
 
 
@@ -29,12 +32,24 @@ def number(name, default, minimum, maximum):
 class Market:
     def __init__(self):
         pairs = os.getenv("PAIRS", DEFAULT_PAIRS).upper().split(",")
-        self.pairs = list(dict.fromkeys(pair.strip() for pair in pairs))
-        if len(self.pairs) > 50 or any(not re.fullmatch(r"[A-Z0-9]{1,20}USDT", pair) for pair in self.pairs):
-            raise ValueError("PAIRS must contain 1–50 comma-separated USDT spot symbols")
+        normalized = []
+        for pair in pairs:
+            pair = pair.strip()
+            if "/" not in pair and pair.endswith("USDT"):
+                pair = f"{pair[:-4]}/USDT"
+            if not re.fullmatch(r"[A-Z0-9]{1,20}/[A-Z0-9]{1,20}", pair):
+                raise ValueError("PAIRS must use BASE/QUOTE (or legacy BASEUSDT)")
+            base, quote = pair.split("/")
+            if base == quote or quote not in QUOTE_DEFAULTS:
+                raise ValueError("Use distinct currencies and a USDT, USDC, BTC or ETH quote")
+            normalized.append(pair)
+        self.pairs = list(dict.fromkeys(normalized))
+        if len(self.pairs) > 50:
+            raise ValueError("PAIRS accepts up to 50 symbols")
         self.fees = {venue: number(f"{venue.upper()}_FEE_PCT", 0.1, 0, 10) / 100 for venue in VENUES}
         self.buffer = number("BUFFER_PCT", 0.1, 0, 10) / 100
-        self.amount = number("NOTIONAL_USDT", 100, 0.01, 1_000_000)
+        self.amounts = {quote: number(f"NOTIONAL_{quote}", default, 1e-8, 1_000_000)
+                        for quote, default in QUOTE_DEFAULTS.items()}
         self.max_age = number("MAX_AGE_MS", 1000, 50, 60000) / 1000
         self.max_skew = number("MAX_SKEW_MS", 500, 50, 60000) / 1000
         self.quotes = {}
@@ -47,6 +62,8 @@ class Market:
         rows = []
         active = {}
         for pair in self.pairs:
+            currency = pair.split("/")[1]
+            amount = self.amounts[currency]
             fresh = {}
             for venue in VENUES:
                 quote = self.quotes.get((venue, pair))
@@ -60,7 +77,7 @@ class Market:
                 skew = abs(ask.received - bid.received)
                 if skew > self.max_skew:
                     continue
-                estimate = opportunity(ask, bid, self.amount, self.fees[buy], self.fees[sell], self.buffer)
+                estimate = opportunity(ask, bid, amount, self.fees[buy], self.fees[sell], self.buffer)
                 if estimate is None:
                     continue
                 gross, net, rate = estimate
@@ -70,10 +87,10 @@ class Market:
                     active[key] = self.started.get(key, now)
                     duration = round((now - active[key]) * 1000)
                 capacity = min(ask.ask_qty, bid.bid_qty) * ask.ask
-                rows.append([pair, buy, sell, gross, rate, net, capacity, duration])
+                rows.append([pair, buy, sell, gross, rate, net, capacity, duration, currency, amount])
         self.started = active
         rows.sort(key=lambda row: row[4], reverse=True)
-        return {"at": time.time(), "status": self.status, "amount": self.amount,
+        return {"at": time.time(), "status": self.status, "amounts": self.amounts,
                 "fees": self.fees, "buffer": self.buffer, "prices": prices, "rows": rows[:30]}
 
     async def publish(self):

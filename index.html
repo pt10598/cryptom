@@ -21,6 +21,9 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:14px;
 th,td{padding:9px 16px;border-top:1px solid var(--edge);text-align:left}
 th{font-size:13px;color:var(--dim);font-weight:600;background:#101923}
 .num{text-align:right}input{accent-color:var(--mint)}label{white-space:nowrap}
+fieldset{border:1px solid var(--edge);border-radius:8px;margin:0;padding:12px;display:flex;gap:12px;flex-wrap:wrap}
+fieldset label{display:grid;gap:4px}input[type=number]{width:10ch}form{padding:0 16px 16px;display:grid;gap:12px}
+button{justify-self:start;padding:7px 12px;background:var(--mint);color:var(--bg);border:0;border-radius:6px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -33,7 +36,7 @@ th{font-size:13px;color:var(--dim);font-weight:600;background:#101923}
 <section>
   <div class="heading"><h2>跨所價差</h2><label><input type="checkbox" id="only-positive"> 只顯示正淨利</label></div>
   <div class="scroll"><table>
-    <thead><tr><th>交易對</th><th>買入 → 賣出</th><th class="num">毛價差</th><th class="num">估算淨報酬</th><th class="num">淨利 USDT</th><th class="num">一檔容量 USDT</th><th class="num">正淨利持續</th></tr></thead>
+    <thead><tr><th>交易對</th><th>買入 → 賣出</th><th class="num">毛價差</th><th class="num">估算淨報酬</th><th class="num">估算淨利</th><th class="num">一檔容量</th><th class="num">正淨利持續</th></tr></thead>
     <tbody id="rows"></tbody>
   </table></div>
 </section>
@@ -43,6 +46,26 @@ th{font-size:13px;color:var(--dim);font-weight:600;background:#101923}
     <thead><tr><th>交易對</th><th>交易所</th><th class="num">買一</th><th class="num">賣一</th><th class="num">報價年齡</th></tr></thead>
     <tbody id="prices"></tbody>
   </table></div>
+</section>
+<section>
+  <div class="heading"><h2>ATRIX · USDT/TWD 手動比價</h2></div>
+  <form id="atrix">
+    <p>輸入相同數量可成交的雙向報價。以每枚 USDT 計價，使用實付買價與扣除交易費後的實收賣價。試算只在此瀏覽器執行。</p>
+    <fieldset><legend>ATRIX</legend>
+      <label>你買入的價格 <input name="ab" type="number" min="0.000001" step="any" required></label>
+      <label>你賣出的價格 <input name="as" type="number" min="0.000001" step="any" required></label>
+    </fieldset>
+    <fieldset><legend>另一平台</legend>
+      <label>你買入的價格 <input name="bb" type="number" min="0.000001" step="any" required></label>
+      <label>你賣出的價格 <input name="bs" type="number" min="0.000001" step="any" required></label>
+    </fieldset>
+    <fieldset><legend>試算金額</legend>
+      <label>交易數量（USDT） <input name="quantity" type="number" value="100" min="0.000001" step="any" required></label>
+      <label>額外成本（TWD） <input name="cost" type="number" value="0" min="0" step="any" required></label>
+    </fieldset>
+    <button type="submit">試算雙向價差</button>
+    <output id="atrix-result" aria-live="polite"></output>
+  </form>
 </section>
 </main>
 <script>
@@ -74,9 +97,9 @@ function fill(id, rows, columns, message) {
 }
 function render() {
   if (!latest?.rows) return;
-  const {at, status, amount, fees, buffer, prices, rows} = latest;
+  const {at, status, amounts, fees, buffer, prices, rows} = latest;
   get('clock').textContent = clock.format(at * 1000);
-  get('cost').textContent = '單筆 ' + amount + ' USDT　｜　' +
+  get('cost').textContent = '單筆 ' + Object.entries(amounts).map(([unit, size]) => size + ' ' + unit).join('・') + '　｜　' +
     Object.entries(fees).map(([name, fee]) => name + ' ' + percent(fee)).join('・') +
     '　｜　預留成本 ' + percent(buffer);
   const feedNames = Object.keys(fees);
@@ -88,8 +111,8 @@ function render() {
   }));
   const positive = get('only-positive').checked;
   fill('rows', rows.filter(r => !positive || r[5] > 0).map(r => [
-    r[0], r[1] + ' → ' + r[2], percent(r[3]), percent(r[4]), r[5].toFixed(4),
-    r[6].toFixed(2), r[5] > 0 ? (r[7] / 1000).toFixed(1) + ' 秒' : '—'
+    r[0], r[1] + ' → ' + r[2], percent(r[3]), percent(r[4]), price.format(r[5]) + ' ' + r[8],
+    price.format(r[6]) + ' ' + r[8], r[5] > 0 ? (r[7] / 1000).toFixed(1) + ' 秒' : '—'
   ]), 7, positive ? '目前沒有符合條件的正淨利價差' : '等待雙邊新鮮且掛單量足夠的報價');
   fill('prices', prices.map(r => [r[0], r[1], price.format(r[2]), price.format(r[3]), r[4] + ' ms']),
        5, '等待交易所行情');
@@ -97,6 +120,21 @@ function render() {
 fill('rows', [], 7, '等待交易所行情');
 fill('prices', [], 5, '等待交易所行情');
 get('only-positive').addEventListener('change', render);
+const form = get('atrix');
+form.addEventListener('input', () => { get('atrix-result').textContent = ''; });
+form.addEventListener('submit', event => {
+  event.preventDefault();
+  const data = new FormData(form);
+  const value = key => Number(data.get(key));
+  const quantity = value('quantity');
+  const extra = value('cost');
+  const forward = (value('bs') - value('ab')) * quantity - extra;
+  const backward = (value('as') - value('bb')) * quantity - extra;
+  get('atrix-result').textContent = Number.isFinite(forward) && Number.isFinite(backward)
+    ? 'ATRIX 買 → 另一平台賣 ' + forward.toFixed(2) + ' TWD　｜　反向 ' + backward.toFixed(2) +
+      ' TWD　｜　手動試算 ' + clock.format(Date.now())
+    : '請檢查輸入金額';
+});
 const stream = new EventSource('/events');
 stream.onmessage = event => {
   latest = JSON.parse(event.data);

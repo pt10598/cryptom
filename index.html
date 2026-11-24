@@ -21,9 +21,6 @@ section{background:var(--panel);border:1px solid var(--edge);border-radius:14px;
 th,td{padding:9px 16px;border-top:1px solid var(--edge);text-align:left}
 th{font-size:13px;color:var(--dim);font-weight:600;background:#101923}
 .num{text-align:right}input{accent-color:var(--mint)}label{white-space:nowrap}
-fieldset{border:1px solid var(--edge);border-radius:8px;margin:0;padding:12px;display:flex;gap:12px;flex-wrap:wrap}
-fieldset label{display:grid;gap:4px}input[type=number]{width:10ch}form{padding:0 16px 16px;display:grid;gap:12px}
-button{justify-self:start;padding:7px 12px;background:var(--mint);color:var(--bg);border:0;border-radius:6px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -48,24 +45,14 @@ button{justify-self:start;padding:7px 12px;background:var(--mint);color:var(--bg
   </table></div>
 </section>
 <section>
-  <div class="heading"><h2>ATRIX · USDT/TWD 手動比價</h2></div>
-  <form id="atrix">
-    <p>輸入相同數量可成交的雙向報價。以每枚 USDT 計價，使用實付買價與扣除交易費後的實收賣價。試算只在此瀏覽器執行。</p>
-    <fieldset><legend>ATRIX</legend>
-      <label>你買入的價格 <input name="ab" type="number" min="0.000001" step="any" required></label>
-      <label>你賣出的價格 <input name="as" type="number" min="0.000001" step="any" required></label>
-    </fieldset>
-    <fieldset><legend>另一平台</legend>
-      <label>你買入的價格 <input name="bb" type="number" min="0.000001" step="any" required></label>
-      <label>你賣出的價格 <input name="bs" type="number" min="0.000001" step="any" required></label>
-    </fieldset>
-    <fieldset><legend>試算金額</legend>
-      <label>交易數量（USDT） <input name="quantity" type="number" value="100" min="0.000001" step="any" required></label>
-      <label>額外成本（TWD） <input name="cost" type="number" value="0" min="0" step="any" required></label>
-    </fieldset>
-    <button type="submit">試算雙向價差</button>
-    <output id="atrix-result" aria-live="polite"></output>
-  </form>
+  <div class="heading"><h2>正淨利紀錄</h2><span id="history-status" class="muted">讀取紀錄中</span></div>
+  <div class="scroll"><table>
+    <thead><tr><th>首次偵測（台北）</th><th>交易對</th><th>買入 → 賣出</th><th class="num">試算金額</th><th class="num">最高估算淨利</th><th class="num">最高估算淨報酬</th><th class="num">觀察持續</th></tr></thead>
+    <tbody id="history"></tbody>
+  </table></div>
+</section>
+<section>
+  <div class="heading"><h2>ATRIX · USDT/TWD</h2><span class="muted">待接入官方報價</span></div>
 </section>
 </main>
 <script>
@@ -120,21 +107,27 @@ function render() {
 fill('rows', [], 7, '等待交易所行情');
 fill('prices', [], 5, '等待交易所行情');
 get('only-positive').addEventListener('change', render);
-const form = get('atrix');
-form.addEventListener('input', () => { get('atrix-result').textContent = ''; });
-form.addEventListener('submit', event => {
-  event.preventDefault();
-  const data = new FormData(form);
-  const value = key => Number(data.get(key));
-  const quantity = value('quantity');
-  const extra = value('cost');
-  const forward = (value('bs') - value('ab')) * quantity - extra;
-  const backward = (value('as') - value('bb')) * quantity - extra;
-  get('atrix-result').textContent = Number.isFinite(forward) && Number.isFinite(backward)
-    ? 'ATRIX 買 → 另一平台賣 ' + forward.toFixed(2) + ' TWD　｜　反向 ' + backward.toFixed(2) +
-      ' TWD　｜　手動試算 ' + clock.format(Date.now())
-    : '請檢查輸入金額';
+const historyClock = new Intl.DateTimeFormat('zh-TW', {
+  timeZone: 'Asia/Taipei', dateStyle: 'short', timeStyle: 'medium'
 });
+async function refreshHistory() {
+  try {
+    const response = await fetch('/api/history');
+    const data = await response.json();
+    get('history-status').textContent = data.error
+      ? '紀錄暫時無法完整更新 · ' + data.storage : '最近 100 筆 · ' + data.storage;
+    fill('history', data.rows.map(r => [
+      historyClock.format(r.started_at * 1000), r.pair, r.buy + ' → ' + r.sell,
+      price.format(r.amount) + ' ' + r.currency, price.format(r.peak_net) + ' ' + r.currency,
+      percent(r.peak_rate), (r.duration_ms / 1000).toFixed(1) + ' 秒'
+    ]), 7, data.error ? '等待紀錄儲存服務' : '尚未記錄到正淨利機會');
+  } catch {
+    get('history-status').textContent = '無法讀取紀錄';
+  } finally {
+    setTimeout(refreshHistory, 5000);
+  }
+}
+refreshHistory();
 const stream = new EventSource('/events');
 stream.onmessage = event => {
   latest = JSON.parse(event.data);

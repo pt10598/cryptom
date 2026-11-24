@@ -6,17 +6,21 @@ import math
 import os
 import re
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from crypto_monitor import listen, opportunity
+from history import History
 
 VENUES = ("Bybit", "OKX", "Bitget", "Kraken")
 DEFAULT_PAIRS = ",".join(f"{coin}/USDT" for coin in
-                         "BTC ETH SOL XRP DOGE LINK AVAX ADA SUI APT NEAR DOT LTC".split())
+                         ("BTC ETH SOL XRP DOGE LINK AVAX ADA SUI APT NEAR DOT LTC "
+                          "BCH UNI AAVE ATOM ARB OP INJ FIL ICP TRX XLM ETC HBAR ALGO "
+                          "SEI TIA WLD PEPE BONK SHIB TON JUP").split())
 DEFAULT_PAIRS += ",ETH/BTC,SOL/BTC,BTC/USDC,ETH/USDC"
 QUOTE_DEFAULTS = {"USDT": 100, "USDC": 100, "BTC": 0.001, "ETH": 0.05}
 PAGE = Path(__file__).with_name("index.html")
@@ -54,13 +58,17 @@ class Market:
         self.max_skew = number("MAX_SKEW_MS", 500, 50, 60000) / 1000
         self.quotes = {}
         self.status = {}
-        self.started = {}
+        self.active = {}
+        self.pending = {}
+        self.history = History()
+        self.history_error = None
         self.frame = "{}"
 
     def snapshot(self, now):
         prices = []
         rows = []
         active = {}
+        at = time.time()
         for pair in self.pairs:
             currency = pair.split("/")[1]
             amount = self.amounts[currency]
@@ -84,19 +92,53 @@ class Market:
                 duration = 0
                 if net > 0:
                     key = (pair, buy, sell)
-                    active[key] = self.started.get(key, now)
-                    duration = round((now - active[key]) * 1000)
+                    event = self.active.get(key)
+                    if event is None:
+                        event = {"id": uuid.uuid4().hex, "pair": pair, "buy": buy, "sell": sell,
+                                 "currency": currency, "amount": amount, "started_at": at,
+                                 "started_mono": now, "peak_net": net, "peak_rate": rate,
+                                 "peak_capacity": 0}
+                    duration = round((now - event["started_mono"]) * 1000)
+                    event.update(last_at=at, duration_ms=duration,
+                                 peak_net=max(event["peak_net"], net),
+                                 peak_rate=max(event["peak_rate"], rate),
+                                 peak_capacity=max(event["peak_capacity"], min(ask.ask_qty, bid.bid_qty) * ask.ask))
+                    active[key] = event
+                    self.pending[event["id"]] = event.copy()
                 capacity = min(ask.ask_qty, bid.bid_qty) * ask.ask
                 rows.append([pair, buy, sell, gross, rate, net, capacity, duration, currency, amount])
-        self.started = active
+        self.active = active
         rows.sort(key=lambda row: row[4], reverse=True)
-        return {"at": time.time(), "status": self.status, "amounts": self.amounts,
+        return {"at": at, "status": self.status, "amounts": self.amounts,
                 "fees": self.fees, "buffer": self.buffer, "prices": prices, "rows": rows[:30]}
 
     async def publish(self):
         while True:
             self.frame = json.dumps(self.snapshot(time.monotonic()), ensure_ascii=False, allow_nan=False)
             await asyncio.sleep(0.2)
+
+
+    async def write_history(self):
+        ready = False
+        while True:
+            batch = list(self.pending.values())
+            try:
+                if not ready:
+                    await asyncio.to_thread(self.history.initialize)
+                    ready = True
+                if batch:
+                    await asyncio.to_thread(self.history.save, batch)
+                    for event in batch:
+                        if self.pending.get(event["id"]) is event:
+                            self.pending.pop(event["id"])
+                self.history_error = None
+            except Exception as exc:
+                # Bound in-memory backlog if the database remains unavailable.
+                while len(self.pending) > 5000:
+                    self.pending.pop(next(iter(self.pending)))
+                self.history_error = type(exc).__name__
+                ready = False
+            await asyncio.sleep(5 if self.history_error else 1)
 
 
 @asynccontextmanager
@@ -106,6 +148,7 @@ async def lifespan(app):
     tasks = [asyncio.create_task(listen(venue, market.pairs, market.quotes, market.status))
              for venue in VENUES]
     tasks.append(asyncio.create_task(market.publish()))
+    tasks.append(asyncio.create_task(market.write_history()))
     try:
         yield
     finally:
@@ -126,6 +169,18 @@ async def index():
 async def snapshot(request: Request):
     return Response(request.app.state.market.frame, media_type="application/json",
                     headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/history")
+async def history(request: Request, limit: int = Query(default=100, ge=1, le=500)):
+    market = request.app.state.market
+    try:
+        rows = await asyncio.to_thread(market.history.recent, limit)
+    except Exception as exc:
+        return JSONResponse({"error": type(exc).__name__, "storage": market.history.label, "rows": []},
+                            status_code=503, headers={"Cache-Control": "no-store"})
+    return JSONResponse({"error": market.history_error, "storage": market.history.label, "rows": rows},
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/events")
